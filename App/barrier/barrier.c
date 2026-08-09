@@ -72,7 +72,7 @@
 
 #define ANGLE_TURN_180          180.0f  /* 180度转身 */
 #define P2_DOWN_BIAS            0.0f
-#define BRIDGE_RIGHT_BIAS       1.0f   /* 1.0°左修，抵消机械右偏 */
+#define BRIDGE_RIGHT_BIAS       1.0f   /* 1.0°左修，抵消机械右偏（上桥用） */
 #define BRIDGE_RED_ANGLE        1.0f   /* 桥中左偏需强推 */
 #define BRIDGE_RED_LEFT_MASK    0xF800u  /* 传感器11~15，5个 */
 #define BRIDGE_RED_RIGHT_MASK   0x001Fu  /* 传感器0~4，5个 */
@@ -406,12 +406,14 @@ static uint8_t bridge_red_correct(float base_angle, float *tar_angle)
     static float hold_angle = 0.0f;
     static uint8_t hold_side = 0;
     static float saved_kp = 0.0f;
+    static float bridge_base_kp = 0.0f;
 
     if (bridge_red_reset)
     {
         hold = 0;
         hold_side = 0;
-        saved_kp = 0.0f;
+        saved_kp = gyroG_pid_param.kp;
+        bridge_base_kp = gyroG_pid_param.kp;
         bridge_red_reset = 0;
     }
 
@@ -422,7 +424,7 @@ static uint8_t bridge_red_correct(float base_angle, float *tar_angle)
         if (hold == 0 || hold_side != 1)
         {
             saved_kp = gyroG_pid_param.kp;
-            gyroG_pid_param.kp = saved_kp * 1.0f;
+            gyroG_pid_param.kp = saved_kp * 1.8f;
         }
         hold = BRIDGE_RED_HOLD_TICKS;
         hold_side = 1;
@@ -438,7 +440,7 @@ static uint8_t bridge_red_correct(float base_angle, float *tar_angle)
         if (hold == 0 || hold_side != 2)
         {
             saved_kp = gyroG_pid_param.kp;
-            gyroG_pid_param.kp = saved_kp * 1.0f;
+            gyroG_pid_param.kp = saved_kp * 1.8f;
         }
         hold = BRIDGE_RED_HOLD_TICKS;
         hold_side = 2;
@@ -463,6 +465,7 @@ static uint8_t bridge_red_correct(float base_angle, float *tar_angle)
         return 1;
     }
 
+    gyroG_pid_param.kp = bridge_base_kp * 1.3f;
     *tar_angle = base_angle;
     angle.AngleG = *tar_angle;
     motor_all.Gspeed = SPEED2;
@@ -850,14 +853,15 @@ void Barrier_Bridge(void)
             Chassis_SetTargetSpeed(SPEED0);
 
 
-            /* 走够35cm后才启用坡检测，防分岔口误触 */
-            if (fabsf(Chassis_GetMileage()) >= 35.0f &&
+            /* 走够10cm后才启用坡检测，防分岔口误触 */
+            if (fabsf(Chassis_GetMileage()) >= 10.0f &&
                 Stage_DetectedRamp(RAMP_DETECT_BRIDGE))
             {
                 extern UART_HandleTypeDef huart2;
                 const char *msg = "find po, action\r\n";
                 HAL_UART_Transmit(&huart2, (uint8_t *)msg, 16, 0xffff);
                 CarBrake();
+                vTaskDelay(800);  /* 停800ms调整姿态 */
                 mpuZreset(imu.yaw, nodesr.nowNode.angle);
                 origin_angle = nodesr.nowNode.angle;
                 entry_angle = bridge_norm_angle(origin_angle + BRIDGE_RIGHT_BIAS);
@@ -918,6 +922,7 @@ void Barrier_Bridge(void)
 
             /* 切换回循线 */
             CarBrake();
+            vTaskDelay(300);  /* 停300ms稳定姿态 */
             Chassis_MotorControl(is_Line, SPEED1, SPEED1, 0);
 
             motor_pid_clear();   /* 清电机PID残值 */
@@ -1000,8 +1005,13 @@ void Barrier_Hill(void)
     } state = HILL_APPROACH;
 
     float origin_angle = 0.0f;
+    float approach_spd = (nodesr.nowNode.nodenum == B5) ? 10.0f : 12.0f;
+    float saved_kp = gyroG_pid_param.kp;
 
-    Chassis_MotorControl(is_Line, 12, 12, 0);
+    if (nodesr.nowNode.nodenum == B5)
+        gyroG_pid_param.kp = 1.5f;
+
+    Chassis_MotorControl(is_Line, approach_spd, approach_spd, 0);
     vTaskDelay(10);
     Chassis_ClearMileage();
 
@@ -1022,22 +1032,28 @@ void Barrier_Hill(void)
             break;
 
         case HILL_ASCEND:
-            /* 上坡：init=12, pitch>=basic_p+5→12, pitch>=basic_p+15→12, pitch<=basic_p+5→done */
-            RampCtrl_Blocking(RAMP_ASCEND, UPDOWN_SPEED_LOW, origin_angle,
-                              basic_p + 5.0f, UPDOWN_SPEED_LOW,
-                              basic_p + 15.0f, UPDOWN_SPEED_LOW,
+        {
+            float hill_spd = (nodesr.nowNode.nodenum == B5) ? 10.0f : UPDOWN_SPEED_LOW;
+            /* 上坡：B5降速到8减少跑偏，其他用12 */
+            RampCtrl_Blocking(RAMP_ASCEND, hill_spd, origin_angle,
+                              basic_p + 5.0f, hill_spd,
+                              basic_p + 15.0f, hill_spd,
                               basic_p + 5.0f, 0.05f);
             state = HILL_DESCEND;
             break;
+        }
 
         case HILL_DESCEND:
-            /* 下坡：init=12, pitch<=basic_p→12, pitch<=basic_p-8→12, pitch>=basic_p-3→done */
-            RampCtrl_Blocking(RAMP_DESCEND, UPDOWN_SPEED_LOW, origin_angle,
-                              basic_p, UPDOWN_SPEED_LOW,
-                              basic_p - 8.0f, UPDOWN_SPEED_LOW,
+        {
+            float hill_spd = (nodesr.nowNode.nodenum == B5) ? 10.0f : UPDOWN_SPEED_LOW;
+            /* 下坡：B5降速到8减少跑偏 */
+            RampCtrl_Blocking(RAMP_DESCEND, hill_spd, origin_angle,
+                              basic_p, hill_spd,
+                              basic_p - 8.0f, hill_spd,
                               basic_p - 3.0f, 0.05f);
             state = HILL_DONE;
             break;
+        }
 
         default:
             state = HILL_DONE;
@@ -1049,6 +1065,7 @@ void Barrier_Hill(void)
     /* 刹车 */
     CarBrake();
 
+    gyroG_pid_param.kp = saved_kp;
     barrier_done(0, 0);
 }
 

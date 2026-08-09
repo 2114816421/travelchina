@@ -177,6 +177,8 @@ extern u8 route[];
 extern uint8_t isAllRoute;
 extern uint8_t g_last_arrived_node;  /* 最近一次实际检测到达的节点编号 */
 
+uint8_t route_has_fork(u32 flag);
+
 /* ======================== 函数声明 ======================== */
 
 /**

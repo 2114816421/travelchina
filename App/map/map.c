@@ -28,7 +28,9 @@
 #define SCANER_RIGHT_BRANCH_MASK 0x0018u /* 中间偏右两路循迹灯 */
 #define ROUTE_HALF_RATIO        0.5f
 #define ROUTE_DETECT_RATIO      0.7f    /* 与参考工程一致：后 30% 才启动到达检测 */
-#define ROUTE_SLOW_RATIO        0.7f
+#define ROUTE_SLOW_RATIO        0.7f    /* 70%里程开始减速，与检测窗口同步 */
+#define ROUTE_FORK_START        0.25f   /* 25%里程开始岔口主动防护 */
+#define ROUTE_FORK_END          0.80f   /* 80%里程结束岔口主动防护 */
 #define ARRIVE_CONFIRM_SAMPLES  3u
 #define TEMP_TRACK_CLEAR_CM     10.0f
 #define TURN_NEED_ANGLE         10.0f
@@ -39,7 +41,7 @@
 #define TURN_TIMEOUT_CYCLES     (TURN_TIMEOUT_MS / CONTROL_CYCLE_MS)  /* 100 */
 #define TURN_OSCILLATE_NEAR     8.0f    /* 接近目标阈值(度) */
 #define TURN_OSCILLATE_FAR      20.0f   /* 震荡回弹阈值(度) */
-#define NODE_REENTRY_CM         5.0f    /* 节点重入保护距离(cm) */
+#define NODE_REENTRY_CM         8.0f    /* 节点重入保护距离(cm) */
 #define ROUTE_FORCE_RATIO       1.2f    /* 里程超标强制到达阈值（120%段长） */
 #define TURN_STOP_ANGLE         90.0f
 #define TURN_DONE_DEADBAND      3.0f
@@ -493,6 +495,11 @@ static uint8_t route_has_temp_track(u32 flag)
     return ((flag & (Temp_L | Temp_R | Temp_LiuShui)) != 0u) ? 1u : 0u;
 }
 
+uint8_t route_has_fork(u32 flag)
+{
+    return ((flag & (Temp_L | Temp_R | Temp_LiuShui | MUL2SING | MUL2MUL)) != 0u) ? 1u : 0u;
+}
+
 static void temp_track_reset(u32 flag)
 {
     temp_track_phase = route_has_temp_track(flag) ? TEMP_TRACK_PRIMARY : TEMP_TRACK_FINAL;
@@ -533,11 +540,13 @@ static void route_phase_reset(void)
 
 static void cross_line_protect_on(void)
 {
+    Chassis_EnableAntiSnake();
     Chassis_EnableLineLostProtection();
 }
 
 static void cross_line_protect_off(void)
 {
+    Chassis_DisableAntiSnake();
     Chassis_DisableLineLostProtection();
 }
 
@@ -573,26 +582,47 @@ static void cross_line_start(void)
 
 static void cross_track_switch(void)
 {
-    if (!route_is_p2_to_n2())
-        return;
     if (route_state != 2)
         return;
     if (fabsf(Chassis_GetMileage()) < ROUTE_HALF_RATIO * nodesr.nowNode.step)
         return;
 
-    LEFT_RIGHT_LINE = RIGHT_LINE_MODE;
+    if (route_is_p2_to_n2())
+        LEFT_RIGHT_LINE = RIGHT_LINE_MODE;
+    else if ((nodesr.nowNode.flag & Temp_L) == Temp_L)
+        LEFT_RIGHT_LINE = LEFT_LINE_MODE;
+    else if ((nodesr.nowNode.flag & Temp_R) == Temp_R)
+        LEFT_RIGHT_LINE = RIGHT_LINE_MODE;
+    else if ((nodesr.nowNode.flag & Temp_LiuShui) == Temp_LiuShui)
+        LEFT_RIGHT_LINE = CENTER_LINE_MODE;
+    else
+        return;
+
+    /*
+     * 已在50%处主动切换循线模式，标记 FINAL，
+     * 避免到达检测器在70%时再次做 TEMP_TRACK_PRIMARY 切换导致不必要的10cm清出。
+     */
+    temp_track_phase = TEMP_TRACK_FINAL;
     route_state = 3;
 }
 
 static void cross_arrive_slowdown(void);
 
+static float get_detect_ratio(void)
+{
+    /* N16→N18(25cm) 用0.85，其余用0.7 */
+    if (nodesr.nowNode.nodenum == N18 && nodesr.nowNode.step == 25)
+        return 0.85f;
+    return ROUTE_DETECT_RATIO;
+}
+
 static void cross_detect_start(void)
 {
     if (!detect_started &&
-        fabsf(Chassis_GetMileage()) >= ROUTE_DETECT_RATIO * nodesr.nowNode.step)
+        fabsf(Chassis_GetMileage()) >= get_detect_ratio() * nodesr.nowNode.step)
     {
         detect_started = 1;
-        cross_arrive_slowdown();  /* 进入检测窗口同时提前减速 */
+        cross_arrive_slowdown();
     }
 }
 
@@ -609,7 +639,8 @@ static void cross_arrive_slowdown(void)
 
     if (route_need_turn(ad, ad2))
     {
-        Chassis_SetTargetSpeed(SPEED1);
+        float turn_speed = (nodesr.nowNode.nodenum == N19) ? SPEED0 : SPEED1;
+        Chassis_SetTargetSpeed(turn_speed);
     }
     else if (nodesr.nextNode.speed < nodesr.nowNode.speed)
     {
@@ -670,8 +701,10 @@ static void cross_arrive_check(void)
     /* 里程超标强制到达：走超段长120%仍未检测到节点，强制触发 */
     /* N8→N12例外：MUL2MUL检测可靠，不启用兜底 */
     /* N16→N18例外：N16与N18共享DRIGHT图案，靠检测到达 */
-    if (!(nodesr.nowNode.nodenum == N12 && nodesr.nowNode.step == 150)
+    /* B5→N19例外：DRIGHT|CRIGHT双检测可靠 */
+    if (!(nodesr.nowNode.nodenum == N12 && nodesr.nowNode.step == 270)
         && !(nodesr.nowNode.nodenum == N18 && nodesr.nowNode.step == 25)
+        && !(nodesr.nowNode.nodenum == N19 && nodesr.nowNode.step == 100)
         && fabsf(Chassis_GetMileage()) >= nodesr.nowNode.step * ROUTE_FORCE_RATIO)
     {
         route_set_arrived();
@@ -690,6 +723,13 @@ static void cross_line_update(void)
     cross_track_switch();
     cross_detect_start();
     cross_arrive_check();
+
+    /*
+     * 主动岔口防护：仅保留Go_Line层面的误差融合（scaner.c），
+     * 不再额外降速，避免与cross_arrive_slowdown叠加造成巡线不稳。
+     */
+
+    cross_arrive_slowdown();
 
     if (route_arrived())
         is_near_end = 1;
@@ -722,9 +762,12 @@ static void cross_pass_turn(void)
 
 static void cross_stop_turn(void)
 {
-    Chassis_DriveDistance_Blocking(is_Gyro, 15.0f, SPEED1, getAngleZ());
+    float drive_cm = (nodesr.nowNode.nodenum == N18) ? 20.0f :
+                     (nodesr.nowNode.nodenum == N19) ? 15.0f : 15.0f;
+    float lock_angle = (nodesr.nowNode.nodenum == N19) ? getAngleZ() : nodesr.nowNode.angle;
+    Chassis_DriveDistance_Blocking(is_Gyro, drive_cm, SPEED1, lock_angle);
     CarBrake();
-    vTaskDelay(DELAY_SHORT);
+    vTaskDelay((nodesr.nowNode.nodenum == N19) ? 500 : DELAY_SHORT);
     Chassis_Turn_By_StopGyro_Blocking(nodesr.nextNode.angle, getAngleZ());
 }
 
@@ -737,7 +780,8 @@ static void cross_run_turn(void)
     float old_speed_max;
     float old_kd;
 
-    Chassis_DriveDistance_Blocking(is_Gyro, 5.0f, SPEED1, getAngleZ());
+    float run_drive_cm = (nodesr.nowNode.nodenum == N12) ? 2.0f : 5.0f;
+    Chassis_DriveDistance_Blocking(is_Gyro, run_drive_cm, SPEED1, getAngleZ());
 
     /* 限幅差速 + 提高阻尼，防止暴力旋转和来回振荡 */
     old_speed_max = motor_all.GyroT_speedMax;
@@ -846,6 +890,16 @@ static void cross_turn_update(void)
     if (!route_arrived() || Chassis_IsStopLocked())
         return;
 
+    /*
+     * 有障碍物函数（UpStage/Bridge/Hill 等）的节点：
+     * 先返回，让下一周期 cross_barrier_update() 执行障碍物函数。
+     * 障碍物完成后 barrier_done() 置 NODE_ARRIVED_FLAG，
+     * cross_barrier_update() 内部 route_phase_reset()，
+     * 然后本函数再处理转弯。防止到达检测同周期内直接转弯跳过障碍物。
+     */
+    if (!(nodesr.nowNode.function == NONE || nodesr.nowNode.function == 0))
+        return;
+
     cross_line_protect_off();
 
     ad  = fabsf(need2turn(getAngleZ(), nodesr.nextNode.angle));
@@ -860,7 +914,7 @@ static void cross_turn_update(void)
      * STOPTURN 必须独立判断：两个连续段角度相同时 route_need_turn 返回 false，
      * 若把 STOPTURN 放在 else 分支里会被跳过，导致节点不停车直接冲过去。
      */
-    if ((nodesr.nowNode.flag & STOPTURN) == STOPTURN || ad > TURN_STOP_ANGLE)
+    if ((nodesr.nowNode.flag & STOPTURN) == STOPTURN || ad >= TURN_STOP_ANGLE)
         cross_stop_turn();
     else if (!route_need_turn(ad, ad2))
     {
