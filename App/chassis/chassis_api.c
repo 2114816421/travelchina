@@ -23,8 +23,8 @@
 #define CONTROL_CYCLE_MS        5
 #define DELAY_TURN              50
 #define RAMP_CTRL_CYCLE_MS      5
-#define TURN_STOP_DEADBAND      3.0f
-#define TURN_180_DEADBAND       2.0f
+#define TURN_STOP_DEADBAND      2.0f
+#define TURN_180_DEADBAND       3.0f
 #define TURN_180_SPEED          8.0f
 #define TURN_180_KP             2.0f
 #define TURN_180_KD             20.0f
@@ -130,9 +130,9 @@ static void line_pid_by_speed(float speed)
     {
     case SPEED5:
     case SPEED4:
-        line_pid_param.kp = 4.0f;
+        line_pid_param.kp = 5.0f;
         line_pid_param.ki = 0;
-        line_pid_param.kd = 250;
+        line_pid_param.kd = 350;
         break;
     case SPEED3:
         line_pid_param.kp = 7.0f;
@@ -150,9 +150,9 @@ static void line_pid_by_speed(float speed)
         line_pid_param.kd = 250;
         break;
     case SPEED0:
-        line_pid_param.kp = 13.0f;
+        line_pid_param.kp = 15.0f;
         line_pid_param.ki = 0;
-        line_pid_param.kd = 250;
+        line_pid_param.kd = 350;
         break;
     case SPEED1:
         line_pid_param.kp = 15.0f;

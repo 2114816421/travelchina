@@ -6,6 +6,7 @@
 
 #include "scaner.h"
 #include "map.h"
+#include "../App/chassis/chassis_api.h"
 #include "math.h"
 #include "stdio.h"
 #include "pid.h"
@@ -74,7 +75,7 @@ static uint16_t read_gpio_16ch(void)
     data ^= ((HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_4))  << 6);
     data ^= ((HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_3))  << 5);
     data ^= ((HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_1))  << 4);
-    data ^= ((HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_0))  << 3);
+    data ^= ((HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_6))  << 3);
     data ^= ((HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_3))  << 2);
     data ^= ((HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_2))  << 1);
     data ^= ((HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_14)) << 0);
@@ -128,17 +129,16 @@ void Go_Line(float speed)
     line_pid_obj.target = scaner_set.CatchsensorNum;
 
     /*
-     * 岔口干扰抑制：根据路线预判，仅对岔路节点启用。
+     * 岔口干扰抑制：全局生效，不再依赖节点标志位。
      * 多线或4灯以上时将测量值向目标值收窄50%，不全归零——
      * 保留跟踪方向感，但削弱岔线拉扯力。
+     * 节点后前10cm豁免：避免刚离开复杂岔口时纠偏不足丢线。
      */
-    if (route_has_fork(nodesr.nowNode.flag))
+    if ((Scaner.lineNum > 1 || Scaner.ledNum > 3)
+        && fabsf(Chassis_GetMileage()) > 10.0f)
     {
-        if (Scaner.lineNum > 1 || Scaner.ledNum > 3)
-        {
-            line_pid_obj.measure = line_pid_obj.measure * 0.5f
-                                 + line_pid_obj.target * 0.5f;
-        }
+        line_pid_obj.measure = line_pid_obj.measure * 0.5f
+                             + line_pid_obj.target * 0.5f;
     }
 
     /* 位置式 PID 计算 */
@@ -272,7 +272,7 @@ void scaner_gpio_init(void)
     gpio.Pin = GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_14 | GPIO_PIN_15;
     HAL_GPIO_Init(GPIOC, &gpio);
 
-    gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_7;
+    gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5 | GPIO_PIN_6 | GPIO_PIN_7;
     HAL_GPIO_Init(GPIOD, &gpio);
 }
 

@@ -48,7 +48,7 @@
 /* ======================== 距离常量 ======================== */
 
 #define DISTANCE_PLATFORM       20      /* 平台前进距离(cm) */
-#define DISTANCE_PLATFORM_FRONT 10       /* 平台转身前前进距离(cm) */
+#define DISTANCE_PLATFORM_FRONT 5       /* 平台转身前前进距离(cm) */
 #define DISTANCE_PLATFORM_BACK  6       /* 平台转身前后退距离(cm) */
 #define DISTANCE_P2_PLATFORM    75      /* P2平台前进距离(cm) */
 #define DISTANCE_BRIDGE_ASCEND  15      /* 上桥后稳定距离(cm) */
@@ -73,7 +73,7 @@
 #define ANGLE_TURN_180          180.0f  /* 180度转身 */
 #define P2_DOWN_BIAS            0.0f
 #define BRIDGE_RIGHT_BIAS       1.0f   /* 1.0°左修，抵消机械右偏（上桥用） */
-#define BRIDGE_RED_ANGLE        1.0f   /* 桥中左偏需强推 */
+#define BRIDGE_RED_ANGLE        2.0f   /* 桥中左偏需强推 */
 #define BRIDGE_RED_LEFT_MASK    0xF800u  /* 传感器11~15，5个 */
 #define BRIDGE_RED_RIGHT_MASK   0x001Fu  /* 传感器0~4，5个 */
 #define BRIDGE_RED_HOLD_TICKS   20      /* 100ms，缩短响应间隔 */
@@ -102,6 +102,8 @@ typedef struct {
 #define P1_STAGE_APPROACH_SPEED SPEED0
 #define P1_STAGE_RAMP_DETECT    10.0f
 #define P1_STAGE_LINE_MODE      3
+#define P3_STAGE_APPROACH_SPEED SPEED4
+#define P3_STAGE_RAMP_DETECT    10.0f
 
 static void line_mode_reset(uint8_t mode)
 {
@@ -637,19 +639,24 @@ void Stage(void)
         ramp_detect = P1_STAGE_RAMP_DETECT;
         line_mode_reset(P1_STAGE_LINE_MODE);
     }
+    else if (nodesr.nowNode.nodenum == P3)
+    {
+        approach_speed = P3_STAGE_APPROACH_SPEED;
+        ramp_detect = P3_STAGE_RAMP_DETECT;
+    }
 
     /* 循线前进 */
     Chassis_MotorControl(is_Line, approach_speed, approach_speed, 0);
     Chassis_ClearMileage();
+
+    /* 记录上坡前航向（仅一次，避免每次检测前阻塞100ms错过窗口） */
+    GyroStableReset(GYRO_STABLE_SAMPLES, &origin_angle);
 
     while (state != STAGE_DONE)
     {
         switch (state)
         {
         case STAGE_ASCEND:
-            /* 检测坡道（20度） */
-            GyroStableReset(GYRO_STABLE_SAMPLES, &origin_angle);
-
             if (Stage_DetectedRamp(ramp_detect))
             {
                 if (origin_angle == 0)
@@ -853,8 +860,8 @@ void Barrier_Bridge(void)
             Chassis_SetTargetSpeed(SPEED0);
 
 
-            /* 走够10cm后才启用坡检测，防分岔口误触 */
-            if (fabsf(Chassis_GetMileage()) >= 10.0f &&
+            /* 走够5cm后才启用坡检测，防分岔口误触 */
+            if (fabsf(Chassis_GetMileage()) >= 5.0f &&
                 Stage_DetectedRamp(RAMP_DETECT_BRIDGE))
             {
                 extern UART_HandleTypeDef huart2;

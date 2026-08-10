@@ -39,6 +39,7 @@ void main_task(void *pvParameters)
     vTaskDelay(100);
     while (Infrared_ahead == 0) vTaskDelay(5);   /* 等待挡板 */
     while (Infrared_ahead == 1) vTaskDelay(5);   /* 等待移除挡板 */
+    Chassis_SetTargetSpeed(SPEED4);
 #else
     /* 地图初始化 */
     mapInit();

@@ -14,6 +14,8 @@
 #include "delay.h"
 #include "math.h"
 #include "bsp_linefollower.h"
+#include "stdio.h"
+#include "usart.h"
 
 /* ======================== 控制周期和延时常量 ======================== */
 
@@ -33,20 +35,23 @@
 #define ROUTE_FORK_END          0.80f   /* 80%里程结束岔口主动防护 */
 #define ARRIVE_CONFIRM_SAMPLES  3u
 #define TEMP_TRACK_CLEAR_CM     10.0f
+#define NODE_ARRIVAL_CLEAR_CM    5.0f    /* 到达节点后清出标记区 */
 #define TURN_NEED_ANGLE         10.0f
 
 /* ======================== 保护阈值 ======================== */
 
-#define TURN_TIMEOUT_MS         500     /* 转弯硬超时 500ms */
-#define TURN_TIMEOUT_CYCLES     (TURN_TIMEOUT_MS / CONTROL_CYCLE_MS)  /* 100 */
+#define TURN_TIMEOUT_MS         800     /* 转弯硬超时 800ms */
+#define TURN_TIMEOUT_CYCLES     (TURN_TIMEOUT_MS / CONTROL_CYCLE_MS)  /* 400 */
 #define TURN_OSCILLATE_NEAR     8.0f    /* 接近目标阈值(度) */
-#define TURN_OSCILLATE_FAR      20.0f   /* 震荡回弹阈值(度) */
-#define NODE_REENTRY_CM         8.0f    /* 节点重入保护距离(cm) */
+#define TURN_OSCILLATE_FAR      40.0f   /* 震荡回弹阈值(度) */
+#define NODE_REENTRY_CM         5.0f    /* 节点重入保护距离(cm) */
 #define ROUTE_FORCE_RATIO       1.2f    /* 里程超标强制到达阈值（120%段长） */
 #define TURN_STOP_ANGLE         90.0f
-#define TURN_DONE_DEADBAND      3.0f
+#define TURN_DONE_DEADBAND      5.0f
+#define TURN_SCALE              1.0f    /* 转弯比例补偿 */
 #define TURN_RUN_SPEED_MAX      6.0f    /* 行进转弯差速上限 */
-#define TURN_RUN_KD_BOOST       15.0f   /* 行进转弯临时kd，抑制震荡 */
+#define TURN_RUN_KP_BOOST       2.0f    /* 行进转弯临时kp */
+#define TURN_RUN_KD_BOOST       20.0f   /* 行进转弯临时kd，抑制震荡 */
 
 /* ======================== 全局变量定义 ======================== */
 
@@ -149,7 +154,7 @@ void mapInit_test_P3(void)
     /* nextNode = N3→N8连接（门，xunbao原版N8即门位置） */
     nodesr.nextNode = Node[20]; /* {N8, DRIGHT|DLEFT, 140, 75, SPEED0, DOOR} */
 
-    nodesr.flag = 0;  /* 不触发barrier，直接巡线 */
+    nodesr.flag = 0;  /* 先巡线P3→N3，到达后才触发转弯 */
     nodesr.lastNode.nodenum = P3;
 
     test_stop_after_n8 = 0;  /* 到达N8后继续往后走 */
@@ -702,7 +707,17 @@ static void cross_arrive_check(void)
     /* N8→N12例外：MUL2MUL检测可靠，不启用兜底 */
     /* N16→N18例外：N16与N18共享DRIGHT图案，靠检测到达 */
     /* B5→N19例外：DRIGHT|CRIGHT双检测可靠 */
-    if (!(nodesr.nowNode.nodenum == N12 && nodesr.nowNode.step == 270)
+    /* P3→N3例外：DRIGHT检测可能在N3路口漏检，205cm段走完即强制到达 */
+    /* N3→N8例外：门结构遮挡，80cm段走完即强制到达 */
+    if ((nodesr.nowNode.nodenum == N3 && nodesr.nowNode.step == 205
+         && fabsf(Chassis_GetMileage()) >= 205.0f)
+        || (nodesr.nowNode.nodenum == N8 && nodesr.nowNode.step == 80
+            && fabsf(Chassis_GetMileage()) >= 80.0f))
+    {
+        route_set_arrived();
+        cross_arrive_slowdown();
+    }
+    else if (!(nodesr.nowNode.nodenum == N12 && nodesr.nowNode.step == 270)
         && !(nodesr.nowNode.nodenum == N18 && nodesr.nowNode.step == 25)
         && !(nodesr.nowNode.nodenum == N19 && nodesr.nowNode.step == 100)
         && fabsf(Chassis_GetMileage()) >= nodesr.nowNode.step * ROUTE_FORCE_RATIO)
@@ -762,13 +777,36 @@ static void cross_pass_turn(void)
 
 static void cross_stop_turn(void)
 {
-    float drive_cm = (nodesr.nowNode.nodenum == N18) ? 20.0f :
+    float drive_cm = (nodesr.nowNode.nodenum == N18) ? 18.0f :
                      (nodesr.nowNode.nodenum == N19) ? 15.0f : 15.0f;
     float lock_angle = (nodesr.nowNode.nodenum == N19) ? getAngleZ() : nodesr.nowNode.angle;
     Chassis_DriveDistance_Blocking(is_Gyro, drive_cm, SPEED1, lock_angle);
     CarBrake();
-    vTaskDelay((nodesr.nowNode.nodenum == N19) ? 500 : DELAY_SHORT);
-    Chassis_Turn_By_StopGyro_Blocking(nodesr.nextNode.angle, getAngleZ());
+    vTaskDelay(DELAY_SHORT);
+    {
+        uint8_t n19_turn = (nodesr.nowNode.nodenum == N19);
+        float turn_amt = need2turn(nodesr.nowNode.angle, nodesr.nextNode.angle);
+        float compensated = nodesr.nowNode.angle + turn_amt * TURN_SCALE;
+        while (compensated > 180.0f)  compensated -= 360.0f;
+        while (compensated <= -180.0f) compensated += 360.0f;
+
+        /* N19原地90°转时暂时关闭保护，避免车身抖动误触发 */
+        if (n19_turn) {
+            Chassis_DisableRollProtection();
+            Chassis_DisableYawJumpProtection();
+        }
+        Chassis_Turn_By_StopGyro_Blocking(compensated, getAngleZ());
+        if (n19_turn) {
+            Chassis_EnableRollProtection();
+            Chassis_EnableYawJumpProtection();
+        }
+
+        char buf[48];
+        int len = snprintf(buf, sizeof(buf), "T:%.0f A:%.0f\r\n",
+                           (double)compensated, (double)getAngleZ());
+        HAL_UART_Transmit(&huart2, (uint8_t *)buf, len, 0xffff);
+    }
+
 }
 
 static void cross_run_turn(void)
@@ -778,6 +816,7 @@ static void cross_run_turn(void)
     uint8_t  was_near;  /* 曾经接近过目标 */
 
     float old_speed_max;
+    float old_kp;
     float old_kd;
 
     float run_drive_cm = (nodesr.nowNode.nodenum == N12) ? 2.0f : 5.0f;
@@ -785,21 +824,28 @@ static void cross_run_turn(void)
 
     /* 限幅差速 + 提高阻尼，防止暴力旋转和来回振荡 */
     old_speed_max = motor_all.GyroT_speedMax;
+    old_kp = gyroT_pid_param.kp;
     old_kd = gyroT_pid_param.kd;
     motor_all.GyroT_speedMax = TURN_RUN_SPEED_MAX;
+    gyroT_pid_param.kp = TURN_RUN_KP_BOOST;
     gyroT_pid_param.kd = TURN_RUN_KD_BOOST;
 
-    Chassis_SetMode(is_Turn);
-    angle.AngleT = nodesr.nextNode.angle;
+    float turn_amt_run = need2turn(nodesr.nowNode.angle, nodesr.nextNode.angle);
+    float compensated_run = nodesr.nowNode.angle + turn_amt_run * TURN_SCALE;
+    while (compensated_run > 180.0f)  compensated_run -= 360.0f;
+    while (compensated_run <= -180.0f) compensated_run += 360.0f;
 
-    err      = fabsf(need2turn(getAngleZ(), nodesr.nextNode.angle));
+    Chassis_SetMode(is_Turn);
+    angle.AngleT = compensated_run;
+
+    err      = fabsf(need2turn(getAngleZ(), compensated_run));
     was_near = 0;
     timeout  = TURN_TIMEOUT_CYCLES;  /* 500ms 硬超时 */
 
     while (err > TURN_DONE_DEADBAND)
     {
         vTaskDelay(CONTROL_CYCLE_MS);
-        err = fabsf(need2turn(getAngleZ(), nodesr.nextNode.angle));
+        err = fabsf(need2turn(getAngleZ(), compensated_run));
 
         /* 曾经接近目标(8°内)，现在又弹回超过20° → 震荡，立即刹车 */
         if (err < TURN_OSCILLATE_NEAR)
@@ -819,7 +865,15 @@ static void cross_run_turn(void)
     }
 
     motor_all.GyroT_speedMax = old_speed_max;
+    gyroT_pid_param.kp = old_kp;
     gyroT_pid_param.kd = old_kd;
+    {
+        char buf[48];
+        int len = snprintf(buf, sizeof(buf), "Tr:%.0f A:%.0f\r\n",
+                           (double)compensated_run, (double)getAngleZ());
+        HAL_UART_Transmit(&huart2, (uint8_t *)buf, len, 0xffff);
+    }
+
 }
 
 static uint8_t cross_need_gyro_clearance(void)
