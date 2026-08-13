@@ -137,8 +137,7 @@ void Go_Line(float speed)
     if ((Scaner.lineNum > 1 || Scaner.ledNum > 3)
         && fabsf(Chassis_GetMileage()) > 10.0f)
     {
-        line_pid_obj.measure = line_pid_obj.measure * 0.5f
-                             + line_pid_obj.target * 0.5f;
+        line_pid_obj.measure = line_pid_obj.target;
     }
 
     /* 位置式 PID 计算 */

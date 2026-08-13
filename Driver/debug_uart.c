@@ -70,10 +70,24 @@ void debug_uart_init(void)
 void debug_uart_tick(void)
 {
     static uint8_t cnt = 0;
+    static uint8_t last_locked = 0;
     char buf[DBG_BUF_SIZE];
 
     if (Chassis_IsStopLocked())
+    {
+        if (!last_locked)
+        {
+            extern volatile uint8_t g_barrier_step;
+            snprintf(buf, DBG_BUF_SIZE, "STOP:%d mile:%.1f step:%d\r\n",
+                     (int)Chassis_GetStopReason(),
+                     (double)Chassis_GetMileage(),
+                     (int)g_barrier_step);
+            dbg_send(buf);
+        }
+        last_locked = 1;
         return;
+    }
+    last_locked = 0;
 
     if (++cnt < 20)
         return;

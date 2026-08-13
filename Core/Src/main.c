@@ -164,10 +164,10 @@ int main(void)
     int32_t pwm;
     for (pwm = 0; pwm <= WHEEL_REV_PWM; pwm += 50)
     {
-      motor_set_pwm(1, -pwm);
-      motor_set_pwm(2, -pwm);
-      motor_set_pwm(3, -pwm);
-      motor_set_pwm(4, -pwm);
+      motor_set_pwm(1, pwm);
+      motor_set_pwm(2, pwm);
+      motor_set_pwm(3, pwm);
+      motor_set_pwm(4, pwm);
       HAL_Delay(20);
     }
   }
