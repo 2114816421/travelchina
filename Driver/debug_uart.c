@@ -16,7 +16,7 @@
 #define DBG_L1      0
 #define DBG_R0      0
 #define DBG_R1      0
-#define DBG_YAW     0
+#define DBG_YAW     0 
 #define DBG_PITCH   0
 #define DBG_ROLL    0
 #define DBG_LINEPID 0
@@ -32,6 +32,7 @@
 #define DBG_STAGE_TURN 0
 #define DBG_ARRIVE   1
 #define DBG_SCANER   0
+#define DBG_RAMP     1
 
 #define DBG_BUF_SIZE 128
 
@@ -205,6 +206,20 @@ void debug_uart_tick(void)
         r[8] = '\0'; l[8] = '\0';
         snprintf(buf, DBG_BUF_SIZE, "S L:%s R:%s num=%d\r\n", l, r, Scaner.ledNum);
         dbg_send(buf);
+    }
+#endif
+#if DBG_RAMP
+    {
+        extern volatile int8_t g_ramp_dir;
+        extern volatile int8_t g_ramp_state;
+        if (g_ramp_state >= 0)
+        {
+            snprintf(buf, DBG_BUF_SIZE,
+                     "RAMP dir=%d state=%d pitch=%.2f basic=%.2f\r\n",
+                     (int)g_ramp_dir, (int)g_ramp_state,
+                     (double)imu.pitch, (double)basic_p);
+            dbg_send(buf);
+        }
     }
 #endif
 }

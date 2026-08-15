@@ -8,7 +8,6 @@
 #include "motor.h"
 #include "stdio.h"
 #include "motor_task.h"
-#include "sin_generate.h"
 #include "math.h"
 
 /* ======================== 电机 PID 对象定义 ======================== */
@@ -211,7 +210,7 @@ void pid_init(void)
     motor_pid_paramR1.actualMax = 500;
 
     /* ---------- 默认循线 ---------- */
-    line_pid_param.kp = 100;
+    line_pid_param.kp = 80;
     line_pid_param.ki = 0;
     line_pid_param.kd = 80;
     line_pid_param.differential_filterK = 0.5f;
@@ -219,7 +218,7 @@ void pid_init(void)
     line_pid_param.outputMin = -300;
 
     /* ---------- 转弯控制 ---------- */
-    gyroT_pid_param.kp = 1.50f;
+    gyroT_pid_param.kp = 1.2f;
     gyroT_pid_param.ki = 0;
     gyroT_pid_param.kd = 1.8f;
     gyroT_pid_param.differential_filterK = 1.0f;
@@ -227,7 +226,7 @@ void pid_init(void)
     gyroT_pid_param.outputMin = -500;
 
     /* ---------- 平滑陀螺仪 ---------- */
-    gyroG_pid_param.kp = 0.8f;
+    gyroG_pid_param.kp = 0.6f;
     gyroG_pid_param.ki = 0;
     gyroG_pid_param.kd = 4.0f;
     gyroG_pid_param.differential_filterK = 0.5f;
@@ -235,7 +234,7 @@ void pid_init(void)
     gyroG_pid_param.outputMin = -500;
 
     /* ---------- 漂移补偿 ---------- */
-    GyroP_pid_param.kp = 0.9f;
+    GyroP_pid_param.kp = 0.7f;
     GyroP_pid_param.ki = 0.004f;
     GyroP_pid_param.kd = 0.5f;
     GyroP_pid_param.differential_filterK = 0.5f;
@@ -243,7 +242,7 @@ void pid_init(void)
     GyroP_pid_param.outputMin = -100;
 
     /* ---------- 灰度循线 ---------- */
-    lineG_pid_param.kp = 15;
+    lineG_pid_param.kp = 12;
     lineG_pid_param.ki = 0;
     lineG_pid_param.kd = 5;
     lineG_pid_param.differential_filterK = 0.5f;
@@ -294,57 +293,4 @@ void motor_pid_clear(void)
     motor_L1 = (struct I_pid_obj){0, 0, 0, 0, 0, 0};
     motor_R0 = (struct I_pid_obj){0, 0, 0, 0, 0, 0};
     motor_R1 = (struct I_pid_obj){0, 0, 0, 0, 0, 0};
-}
-
-/* ======================== 调试接口函数 ======================== */
-
-/**
- * @brief  USMART 调试接口
- * @param  val  参数值
- * @param  deno 分母
- * @param  mode 模式
- * @note   预留接口，当前未实现
- */
-void usmart_pid(uint16_t val, int deno, int mode)
-{
-    /* 预留调试接口 */
-}
-
-/**
- * @brief  修改目标值（调试用）
- * @param  targetq 目标值
- */
-void chage_target(uint16_t targetq)
-{
-    motor_L0.target = sin_generator(&sin1);
-}
-
-/**
- * @brief  修改电机 L1 的 Kp 参数（调试用）
- * @param  param 参数值（实际值 = param / 10.0）
- */
-void speed_pid_kp(int param)
-{
-    motor_pid_paramL1.kp = param / 10.0f;
-    motor_pid_clear();
-}
-
-/**
- * @brief  修改电机 L1 的 Kd 参数（调试用）
- * @param  param 参数值（实际值 = param / 10.0）
- */
-void speed_pid_kd(int param)
-{
-    motor_pid_paramL1.kd = param / 10.0f;
-    motor_pid_clear();
-}
-
-/**
- * @brief  修改电机 L1 的 Ki 参数（调试用）
- * @param  param 参数值（实际值 = param / 100.0）
- */
-void speed_pid_ki(int param)
-{
-    motor_pid_paramL1.ki = param / 100.0f;
-    motor_pid_clear();
 }

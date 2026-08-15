@@ -15,6 +15,7 @@
 #include "map.h"
 #include "chassis_api.h"
 #include "debug_uart.h"
+#include "hmi_display.h"
 
 /* ======================== 速度 PID 参数查表结构 ======================== */
 
@@ -61,24 +62,24 @@ uint8_t WavePlateRight_Flag = 0;
 
 /* change_speed == 1: 高速段 (90~110) */
 static const SpeedPidParam speed_pid_level1[] = {
-    {90.0f, 110.0f, 11.0f, 17.0f},
+    {90.0f, 110.0f, 6.5f, 17.0f},
 };
 
 /* change_speed == 2: 中高速段 (190~210) */
 static const SpeedPidParam speed_pid_level2[] = {
-    {190.0f, 210.0f, 4.0f, 22.0f},
+    {190.0f, 210.0f, 3.0f, 22.0f},
 };
 
 /* change_speed == 3: 多段检测 */
 static const SpeedPidParam speed_pid_level3[] = {
-    {40.0f,  60.0f,  22.0f, 16.0f},    /* 低速段 */
-    {90.0f,  110.0f, 11.0f, 17.0f},    /* 中速段 */
-    {190.0f, 210.0f,  4.0f, 22.0f},    /* 高速段 */
+    {40.0f,  60.0f,  18.0f, 16.0f},    /* 低速段 */
+    {90.0f,  110.0f, 9.0f, 17.0f},     /* 中速段 */
+    {190.0f, 210.0f, 3.0f, 22.0f},     /* 高速段 */
 };
 
 /* change_speed == 4: 超高速段 (290~310) */
 static const SpeedPidParam speed_pid_level4[] = {
-    {290.0f, 310.0f, 2.4f, 26.0f},
+    {290.0f, 310.0f, 2.0f, 26.0f},
 };
 
 /* ======================== 私有函数声明 ======================== */
@@ -490,55 +491,6 @@ static void motor_apply_pid(void)
     }
 }
 
-/* ======================== 堵转看门狗 ======================== */
-
-#define STALL_PWM_THRESHOLD     2500    /* 堵转PWM阈值(~25%占空比) */
-#define STALL_SPEED_THRESHOLD   1       /* 堵转速度阈值(编码器脉冲/5ms) */
-#define STALL_CYCLE_LIMIT       200     /* 堵转确认周期(1s) */
-
-static void motor_stall_watchdog(void)
-{
-    float outputs[4];
-    short spds[4];
-
-    /* 空闲/停车模式跳过检测，清零计数器 */
-    if (PIDMode == is_Free || PIDMode == is_No)
-    {
-        dog[0] = dog[1] = dog[2] = dog[3] = 0;
-        return;
-    }
-
-    outputs[0] = motor_L0.output;
-    outputs[1] = motor_L1.output;
-    outputs[2] = motor_R0.output;
-    outputs[3] = motor_R1.output;
-
-    spds[0] = Speed[0] >= 0 ? Speed[0] : (short)(-Speed[0]);
-    spds[1] = Speed[1] >= 0 ? Speed[1] : (short)(-Speed[1]);
-    spds[2] = Speed[2] >= 0 ? Speed[2] : (short)(-Speed[2]);
-    spds[3] = Speed[3] >= 0 ? Speed[3] : (short)(-Speed[3]);
-
-    for (int i = 0; i < 4; i++)
-    {
-        /* PWM给够了但编码器几乎不动 → 堵转计数 */
-        if ((outputs[i] > STALL_PWM_THRESHOLD || outputs[i] < -STALL_PWM_THRESHOLD)
-            && spds[i] < STALL_SPEED_THRESHOLD)
-        {
-            dog[i]++;
-        }
-        else if (dog[i] > 0)
-        {
-            dog[i]--;
-        }
-
-        if (dog[i] >= STALL_CYCLE_LIMIT)
-        {
-            Chassis_ForceStop(CHASSIS_STOP_STALL);
-            dog[i] = 0;
-        }
-    }
-}
-
 /* ======================== 电机任务主函数 ======================== */
 
 void motor_task(void *pvParameters)
@@ -546,6 +498,7 @@ void motor_task(void *pvParameters)
     portTickType xLastWakeTime;
 
     debug_uart_init();
+    HmiDisplay_Init();
 
     xLastWakeTime = xTaskGetTickCount();
 
@@ -565,6 +518,7 @@ void motor_task(void *pvParameters)
 
         /* 调试串口输出 */
         debug_uart_tick();
+        HmiDisplay_Tick();
 
         /* 3. 电机目标速度计算 */
         motor_update_targets();
@@ -572,8 +526,6 @@ void motor_task(void *pvParameters)
         /* 4. PID 计算和 PWM 输出 */
         motor_apply_pid();
 
-        /* 5. 堵转看门狗（暂禁用） */
-        /* motor_stall_watchdog(); */
     }
 }
 

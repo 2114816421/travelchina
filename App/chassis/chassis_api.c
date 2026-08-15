@@ -17,6 +17,7 @@
 #include "delay.h"
 #include "math.h"
 #include "../map/map.h"
+#include "voice_module.h"
 
 /* ======================== 控制周期常量 ======================== */
 
@@ -40,6 +41,10 @@
 #define TIPOVER_CONFIRM_COUNT   3
 #define YAW_JUMP_WINDOW_COUNT   20      /* 20 * 5ms = 100ms */
 #define YAW_JUMP_LIMIT          360.0f  /* 100ms 内累计 yaw 变化阈值 */
+
+/* 坡道调试状态（debug_uart.c 跨文件打印用；-1=不在坡道） */
+volatile int8_t g_ramp_dir   = -1;   /* RampDir_t：0=上坡 1=下坡 */
+volatile int8_t g_ramp_state = -1;   /* 0=INIT 1=PHASE1 2=PHASE2 */
 
 /* ======================== 底盘内部状态 ======================== */
 
@@ -130,14 +135,14 @@ static void line_pid_by_speed(float speed)
     {
     case SPEED5:
     case SPEED4:
-        line_pid_param.kp = 4.0f;
+        line_pid_param.kp = 3.0f;
         line_pid_param.ki = 0;
-        line_pid_param.kd = 350;
+        line_pid_param.kd = 150;
         break;
     case SPEED3:
-        line_pid_param.kp = 7.0f;
+        line_pid_param.kp = 6.0f;
         line_pid_param.ki = 0;
-        line_pid_param.kd = 300;
+        line_pid_param.kd = 350;
         break;
     case SPEED25:
         line_pid_param.kp = 12.0f;
@@ -155,9 +160,9 @@ static void line_pid_by_speed(float speed)
         line_pid_param.kd = 350;
         break;
     case SPEED1:
-        line_pid_param.kp = 15.0f;
+        line_pid_param.kp = 12.0f;
         line_pid_param.ki = 0;
-        line_pid_param.kd = 350;
+        line_pid_param.kd = 300;
         break;
     case 12:
     case 15:
@@ -195,7 +200,8 @@ float infrared_bridge_correct(float aim, float max_correction)
 void RampCtrl_Blocking(RampDir_t dir, float init_speed, float aim,
                        float thresh1, float speed1,
                        float thresh2, float speed2,
-                       float done_thresh, float GrayCorrectAngle)
+                       float done_thresh, float GrayCorrectAngle,
+                       float max_distance)
 {
     enum { RAMP_INIT, RAMP_PHASE1, RAMP_PHASE2 } state = RAMP_INIT;
 
@@ -207,9 +213,15 @@ void RampCtrl_Blocking(RampDir_t dir, float init_speed, float aim,
     motor_all.Gspeed = init_speed;
     angle.AngleG = aim;
 
+    g_ramp_dir   = (int8_t)dir;
+    g_ramp_state = (int8_t)state;
+
     while (1)
     {
         float pitch = imu.pitch;
+
+        g_ramp_dir   = (int8_t)dir;
+        g_ramp_state = (int8_t)state;
 
         /* GrayCorrectAngle>0时启用红外修正 */
         if (GrayCorrectAngle > 0.0f)
@@ -266,6 +278,13 @@ void RampCtrl_Blocking(RampDir_t dir, float init_speed, float aim,
 
         if (Chassis_IsStopLocked())
             return;
+
+        /* 里程兜底：累计里程超限即刹车退出，避免卡死在坡道上 */
+        if (max_distance > 0.0f && fabsf(Chassis_GetMileage()) >= max_distance)
+        {
+            CarBrake();
+            return;
+        }
 
         vTaskDelay(RAMP_CTRL_CYCLE_MS);
     }
@@ -395,6 +414,12 @@ void Chassis_ForceStop(Chassis_StopReason_t reason)
     if (reason == CHASSIS_STOP_NONE)
         return;
 
+    if (!chassis.stop_locked &&
+        (reason == CHASSIS_STOP_LINE_LOST || reason == CHASSIS_STOP_TIPOVER))
+    {
+        (void)VoiceModule_PlayFailEnd();
+    }
+
     stop_lock_set(reason);
     line_guard_soft_clear();
     yaw_guard_reset();
@@ -444,14 +469,14 @@ void Chassis_DriveDistance_Blocking(uint8_t mode, float distance, float speed, f
         vTaskDelay(CONTROL_CYCLE_MS);
 }
 
-static void chassis_turn_blocking(float target_angle, float deadband, uint8_t stage_turn)
+static void chassis_turn_blocking(float target_angle, float deadband, uint8_t stable_turn)
 {
     uint16_t timeout;
 
-    if (stage_turn)
+    if (stable_turn)
         Stage_turn_Reset();
 
-    StageTurn_Flag = stage_turn;
+    StageTurn_Flag = stable_turn;
     Chassis_SetMode(is_Turn);
     if (Chassis_IsStopLocked())
     {
@@ -466,9 +491,9 @@ static void chassis_turn_blocking(float target_angle, float deadband, uint8_t st
 
     while (PIDMode == is_Turn && !Chassis_IsStopLocked())
     {
-        if (stage_turn && StageTurn_Flag == 0)
+        if (stable_turn && StageTurn_Flag == 0)
             break;
-        if (!stage_turn && fabsf(norm180(target_angle - getAngleZ())) <= deadband)
+        if (!stable_turn && fabsf(norm180(target_angle - getAngleZ())) <= deadband)
             break;
         if (timeout > 0 && --timeout == 0)
             break;
@@ -477,7 +502,7 @@ static void chassis_turn_blocking(float target_angle, float deadband, uint8_t st
 
     StageTurn_Flag = 0;
     Chassis_SetMode(is_No);
-    if (stage_turn)
+    if (stable_turn)
         Stage_turn_Reset();
     vTaskDelay(DELAY_TURN);
 }
@@ -495,7 +520,7 @@ void Chassis_Turn_By_StopGyro_Blocking(float target_angle, float current_angle)
     motor_all.GyroT_speedMax = TURN_180_SPEED;
     gyroT_pid_param.kd = TURN_180_KD;
 
-    chassis_turn_blocking(target_angle, TURN_STOP_DEADBAND, 0);
+    chassis_turn_blocking(target_angle, TURN_STOP_DEADBAND, 1);
 
     motor_all.GyroT_speedMax = old_speed;
     gyroT_pid_param.kd = old_kd;
@@ -553,7 +578,7 @@ void GyroStableReset(uint8_t samples, float *angle_out)
 }
 
 /**
- * @brief  检测是否进入坡道（pitch + 循迹板双重判断 + 消抖）
+ * @brief  检测是否进入坡道（仅靠 pitch 偏离 + 消抖）
  * @param  pitch_thresh pitch偏离阈值(度)
  */
 uint8_t Stage_DetectedRamp(float pitch_thresh)
@@ -561,12 +586,10 @@ uint8_t Stage_DetectedRamp(float pitch_thresh)
     static uint8_t detect_cnt = 0;
     float pitch_dev;
 
-    getline_error();
     pitch_dev = fabsf(imu.pitch - basic_p);
 
-    /* pitch偏离超阈值 且 循迹板出现离地特征（线少或灯少） */
-    if (pitch_dev > pitch_thresh ||
-        (Scaner.lineNum < 3 || Scaner.ledNum < 5))
+    /* 仅靠 pitch 偏离判断进入坡道（原循迹板"线少/灯少"条件恒真，已移除） */
+    if (pitch_dev > pitch_thresh)
     {
         detect_cnt++;
         if (detect_cnt >= 5)    /* 连续5次确认，消抖 */
@@ -804,7 +827,7 @@ void Chassis_Periodic_Update_5ms(void)
             chassis.saved_line_kd = line_pid_param.kd;
         }
         motor_all.Cspeed = chassis.target_speed / 2;    /* 减半 */
-        line_pid_param.kp = 12.0f;
+        line_pid_param.kp = 10.0f;
         line_pid_param.ki = 0;
         line_pid_param.kd = 200.0f;
     }
