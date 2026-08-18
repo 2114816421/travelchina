@@ -1,4 +1,4 @@
-/**
+ /**
  * @file    barrier.c
  * @brief   障碍物处理模块
  * @details 包含zhunbei()准备函数、平台、桥、楼梯等障碍物处理
@@ -64,6 +64,15 @@
 #define BARRIER_DESCEND_SPEED      13.0f
 #define BARRIER_LOW_SPEED          20.0f
 #define BARRIER_MOUNT_SPEED        22.0f
+
+/* 珠峰专用速度（独立于南极/通用宏，避免影响共享流程） */
+#define HIGH_MOUNTAIN_ASCEND1_SPEED 20.0f   /* 第一段上坡（18 → 20） */
+#define HIGH_MOUNTAIN_ASCEND2_SPEED 22.0f   /* 第一段后半/第二段上坡（19 → 22） */
+#define HIGH_MOUNTAIN_TOP_SPEED     15.0f   /* 顶部找挡板（12 → 15） */
+/* 珠峰专用下坡速度（独立于南极/通用宏） */
+#define HIGH_MOUNTAIN_DESCEND1_SPEED 11.0f  /* 第一段下坡（原 9） */
+#define HIGH_MOUNTAIN_VALLEY_SPEED   15.0f  /* 谷底20cm（原 13） */
+#define HIGH_MOUNTAIN_DESCEND2_SPEED 10.0f  /* 第二段下坡（原 8） */
 #define BARRIER_IMPACT_SPEED       16.0f
 #define BARRIER_TURN_SPEED_MAX     25.0f
 #define BARRIER_AFTER_BOARD_FRONT  8.0f
@@ -103,7 +112,7 @@ typedef struct {
 #define RAMP_DETECT_BRIDGE      5.0f    /* 桥坡道检测阈值(度) */
 #define RAMP_DETECT_HILL        8.0f    /* 楼梯坡道检测阈值(度)，15→8：提前触发，抢在翻过坡顶前进入上坡 */
 #define GYRO_STABLE_SAMPLES     50      /* 陀螺仪稳定采样次数 */
-#define P1_STAGE_APPROACH_SPEED SPEED0
+#define P1_STAGE_APPROACH_SPEED SPEED1
 #define P1_STAGE_RAMP_DETECT    10.0f
 #define P1_STAGE_LINE_MODE      3
 #define P3_STAGE_APPROACH_SPEED SPEED1
@@ -241,6 +250,8 @@ static void barrier_door_fail(void)
 
 void Barrier_Door(void)
 {
+    TrafficRouteStatus_t tr_status;
+
     nodesr.flag &= (uint8_t)(~NODE_ARRIVED_FLAG);
     Chassis_SetTargetSpeed(nodesr.nowNode.speed);
     Chassis_SetMode(is_Line);
@@ -252,7 +263,17 @@ void Barrier_Door(void)
     }
 
     CarBrake();
-    (void)TrafficRoute_HandleDoor();
+    tr_status = TrafficRoute_HandleDoor();
+
+    /* 状态分类：视觉识别失败/无结果(SCAN_FAILED/NONE)视为“允许继续”，直接放行；
+     * 非门区边(NO_CHANGE)与正常处理(OK)照常放行；
+     * 地图拼接失败/无可用路线(SPLICE_FAILED/NO_ROUTE)属真正系统错误，ForceStop。 */
+    if (tr_status == TRAFFIC_ROUTE_STATUS_SPLICE_FAILED ||
+        tr_status == TRAFFIC_ROUTE_STATUS_NO_ROUTE)
+    {
+        barrier_door_fail();
+        return;
+    }
     if (Chassis_IsStopLocked())
         return;
     vTaskDelay(pdMS_TO_TICKS(DOOR_WAIT_MS));
@@ -469,7 +490,7 @@ static uint8_t bridge_red_correct(float base_angle, float *tar_angle)
     gyroG_pid_param.kp = bridge_base_kp * 1.3f;
     *tar_angle = base_angle;
     angle.AngleG = *tar_angle;
-    motor_all.Gspeed = SPEED2;
+    motor_all.Gspeed = SPEED2;   /* 桥中央正常巡航 30（纠偏仍 SPEED1=25） */
     return 0;
 }
 
@@ -914,11 +935,10 @@ void Barrier_Bridge(void)
             Chassis_SetTargetSpeed(SPEED0);
 
 
-
             /* 走够3cm后才启用坡检测，防分岔口误触 */
             if (fabsf(Chassis_GetMileage()) >= 3.0f &&
                 Stage_DetectedRamp(RAMP_DETECT_BRIDGE))
-            {       
+            {                               
                 mpuZreset(imu.yaw, nodesr.nowNode.angle);
                 origin_angle = nodesr.nowNode.angle;
                 entry_angle = barrier_angle_normalize(origin_angle + BRIDGE_RIGHT_BIAS);
@@ -1012,9 +1032,6 @@ void Barrier_WavedPlate(float length)
     // 0. 停车抬板前校准一次航向：抵消南极 180° 转身/下坡后的航向漂移
     mpuZreset(imu.yaw, nodesr.nowNode.angle);
 
-    // 1. 先刹车停稳，再执行抬板动作组（抬板期间车身保持静止，等板抬完再前进）
-    CarBrake();
-    barrier_board_detected_action(LSC16_WAIT_INIT_MS, 0u);
 
     // 2. 配置波浪板专用参数（关闭防蛇行，加大抵抗摇摆的阻尼）
     Chassis_DisableAntiSnake();
@@ -1048,10 +1065,6 @@ void Barrier_WavedPlate(float length)
     Chassis_EnableAntiSnake();
     Chassis_EnableLineLostProtection();
 
-    CarBrake();   /* 走完波浪板先停车，等舵机放下再继续 */
-    Lsc16_RunActionGroupBlocking(LSC16_ACTION_TURN_DONE,
-                                 LSC16_ACTION_RUN_ONCE,
-                                 LSC16_WAIT_STAND_MS);
     barrier_continue_after_wave();
 }
 
@@ -1081,6 +1094,11 @@ void Barrier_Hill(void)
     if (nodesr.nowNode.nodenum == B5)
         gyroG_pid_param.kp = 1.2f;
 
+    /* 进入台阶前重校准航向：消除来路（如 C9→N22 的 STOPTURN 右转 90° 后）
+     * 残留的 yaw 偏角，避免 GyroStableReset 采到带偏的均值、上坡斜走。
+     * 这正是 B6 等边 RESTMPUZ 标志应做的校准。（对标 Barrier_WavedPlate 等） */
+    mpuZreset(imu.yaw, nodesr.nowNode.angle);
+
     Chassis_MotorControl(is_Line, approach_spd, approach_spd, 0);
     vTaskDelay(10);
     Chassis_ClearMileage();
@@ -1090,12 +1108,13 @@ void Barrier_Hill(void)
         switch (state)
         {
         case HILL_APPROACH:
-            GyroStableReset(GYRO_STABLE_SAMPLES, &origin_angle);
-
+            /* 坡道检测：基于 pitch 偏离（独立消抖），不依赖 origin_angle。 */
             if (Stage_DetectedRamp(RAMP_DETECT_HILL))
             {
-                if (origin_angle == 0)
-                    origin_angle = getAngleZ();
+                /* 坡检测成立时一次性采集稳定航向（基于上面已校准的 yaw）。
+                 * 不用循环内反复刷新，避免取到转向未稳时的偏均值；
+                 * 用"稳定采样"均值替代旧的浮点恒等死比较。 */
+                GyroStableReset(GYRO_STABLE_SAMPLES, &origin_angle);
                 Chassis_MotorControl(is_Gyro, HILL_APPROACH_SPEED, HILL_APPROACH_SPEED, origin_angle);
                 state = HILL_ASCEND;
             }
@@ -1361,8 +1380,8 @@ static uint8_t high_mountain_first_ascend(float *heading)
     line_pid_param.kd = 200.0f;
     scaner_set.EdgeIgnore = 3;
     Chassis_ClearMileage();
-    Chassis_MotorControl(is_Line, BARRIER_MOUNT_SPEED - 6.0f,
-                         BARRIER_MOUNT_SPEED - 6.0f, 0.0f);
+    Chassis_MotorControl(is_Line, HIGH_MOUNTAIN_ASCEND1_SPEED,
+                         HIGH_MOUNTAIN_ASCEND1_SPEED, 0.0f);
 
     start = xTaskGetTickCount();
     getline_error();
@@ -1397,8 +1416,8 @@ static uint8_t high_mountain_first_ascend(float *heading)
     }
 
     Chassis_ClearMileage();
-    Chassis_MotorControl(is_Gyro, BARRIER_MOUNT_SPEED - 5.0f,
-                         BARRIER_MOUNT_SPEED - 5.0f, *heading);
+    Chassis_MotorControl(is_Gyro, HIGH_MOUNTAIN_ASCEND2_SPEED,
+                         HIGH_MOUNTAIN_ASCEND2_SPEED, *heading);
     if (!barrier_wait_pitch_below(AFTER_UP, 120.0f, BARRIER_LONG_TIMEOUT_MS))
         return 0u;
 
@@ -1411,13 +1430,13 @@ static uint8_t high_mountain_second_ascend(float *heading)
     uint8_t climbed = 0;   /* 是否已进入第二段爬坡（pitch 曾升过爬坡角） */
 
     scaner_set.EdgeIgnore = 3;
-    if (!barrier_drive_distance(is_Line, 5.0f, BARRIER_MOUNT_SPEED - 5.0f,
+    if (!barrier_drive_distance(is_Line, 5.0f, HIGH_MOUNTAIN_ASCEND2_SPEED,
                                 0.0f, BARRIER_SHORT_TIMEOUT_MS))
         return 0u;
 
     Chassis_ClearMileage();
-    Chassis_MotorControl(is_Line, BARRIER_MOUNT_SPEED - 5.0f,
-                         BARRIER_MOUNT_SPEED - 5.0f, 0.0f);
+    Chassis_MotorControl(is_Line, HIGH_MOUNTAIN_ASCEND2_SPEED,
+                         HIGH_MOUNTAIN_ASCEND2_SPEED, 0.0f);
 
     /* 等到坡顶：纯俯仰角判定——pitch 先升过 BEGIN_UP（进入坡），
        再回落到 AFTER_UP（到顶）；循迹灯不参与位置判定，仅用于巡线转向 */
@@ -1462,8 +1481,8 @@ static uint8_t high_mountain_descend(float heading, float normal_liushui_rate)
     line_pid_param.kd = 400.0f;
     LiuShuiRate = 2.1f;
     Chassis_ClearMileage();
-    Chassis_MotorControl(is_Line, BARRIER_DESCEND_SPEED - 4.0f,
-                         BARRIER_DESCEND_SPEED - 4.0f, 0.0f);
+    Chassis_MotorControl(is_Line, HIGH_MOUNTAIN_DESCEND1_SPEED,
+                         HIGH_MOUNTAIN_DESCEND1_SPEED, 0.0f);
 
     /* 第一段下坡：纯俯仰角判定 */
     {
@@ -1491,14 +1510,14 @@ static uint8_t high_mountain_descend(float heading, float normal_liushui_rate)
     LiuShuiRate = normal_liushui_rate;
 
     /* 谷底过渡：硬走 20cm 穿越谷底 */
-    if (!barrier_drive_distance(is_Gyro, 20.0f, BARRIER_DESCEND_SPEED, heading,
+    if (!barrier_drive_distance(is_Gyro, 20.0f, HIGH_MOUNTAIN_VALLEY_SPEED, heading,
                                 BARRIER_SHORT_TIMEOUT_MS))
         return 0u;
 
     /* 第二段下坡检测 */
     Chassis_ClearMileage();
-    Chassis_MotorControl(is_Gyro, BARRIER_DESCEND_SPEED - 5.0f,
-                         BARRIER_DESCEND_SPEED - 5.0f, heading);
+    Chassis_MotorControl(is_Gyro, HIGH_MOUNTAIN_DESCEND2_SPEED,
+                         HIGH_MOUNTAIN_DESCEND2_SPEED, heading);
     if (!barrier_wait_pitch_below(BEGIN_DOWN, 250.0f, BARRIER_LONG_TIMEOUT_MS))
         return 0u;
     if (!barrier_wait_pitch_above(AFTER_DOWN, 250.0f, BARRIER_LONG_TIMEOUT_MS))
@@ -1531,10 +1550,11 @@ void Barrier_HighMountain(void)
         return;
     }
 
-    Chassis_MotorControl(is_Gyro, 10.0f, 10.0f, heading);
+    Chassis_MotorControl(is_Gyro, HIGH_MOUNTAIN_TOP_SPEED,
+                         HIGH_MOUNTAIN_TOP_SPEED, heading);
     while (Infrared_ahead == 0)
         vTaskDelay(CONTROL_CYCLE_MS);
-    if (!barrier_drive_distance(is_Gyro, BARRIER_AFTER_BOARD_FRONT, 10.0f, heading,
+    if (!barrier_drive_distance(is_Gyro, BARRIER_AFTER_BOARD_FRONT, 12.0f, heading,
                                 BARRIER_SHORT_TIMEOUT_MS))
     {
         barrier_fail(&snapshot);
